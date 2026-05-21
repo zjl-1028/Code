@@ -17,39 +17,46 @@ class WordEmbScore(nn.Module):
         ie = self.i_emb(i)
         return self.fc(torch.cat([ue, ie], -1)).squeeze(-1)
 
-class TextFeat(nn.Module):
-    def __init__(self, vocab_size, emb_dim=128):
+class TextFeatureExtractor(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=64):
         super().__init__()
-        self.emb = nn.Embedding(vocab_size, emb_dim)
-        self.conv = nn.Conv1d(emb_dim, 64, 3, padding=1)
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.cnn = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=1)
+        self.bilstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.attention = nn.MultiheadAttention(hidden_dim * 2, num_heads=2, batch_first=True)
 
     def forward(self, x):
-        x = self.emb(x).transpose(1, 2)
-        x = torch.relu(self.conv(x))
-        x = self.pool(x).squeeze(-1)
-        return x
+        x = self.embedding(x)
+        x = x.transpose(1, 2)
+        x = self.cnn(x)
+        x = x.transpose(1, 2)
+        x, _ = self.bilstm(x)
+        attn_out, _ = self.attention(x, x, x)
+        return attn_out.mean(dim=1)
 
-class TriCommentCls(nn.Module):
-    def __init__(self, in_dim):
+class CommentClassifier(nn.Module):
+    def __init__(self, input_dim):
         super().__init__()
-        self.cls = nn.Linear(in_dim, 3)
+        self.fc = nn.Linear(input_dim, 3)
 
     def forward(self, x):
-        return self.cls(x)
+        return self.fc(x)
 
-class SarcCHead(nn.Module):
-    def __init__(self, in_dim):
+class SarcasmFactor(nn.Module):
+    def __init__(self, input_dim):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(in_dim, 1), nn.Sigmoid())
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
-class OffsetSHead(nn.Module):
-    def __init__(self, in_dim):
+class BiasCorrection(nn.Module):
+    def __init__(self, input_dim):
         super().__init__()
-        self.fc = nn.Linear(in_dim, 1)
+        self.fc = nn.Linear(input_dim, 1)
 
     def forward(self, x):
         return self.fc(x).squeeze(-1)
@@ -57,17 +64,17 @@ class OffsetSHead(nn.Module):
 class TotalModel(nn.Module):
     def __init__(self, user_num, item_num, vocab_size):
         super().__init__()
-        self.r_branch = WordEmbScore(user_num, item_num)
-        self.txt_feat = TextFeat(vocab_size)
-        self.cls_head = TriCommentCls(64)
-        self.c_head = SarcCHead(64)
-        self.s_head = OffsetSHead(64)
+        self.base_predictor = WordEmbScore(user_num, item_num)
+        self.text_extractor = TextFeatureExtractor(vocab_size)
+        self.classifier = CommentClassifier(128)
+        self.sarcasm_factor = SarcasmFactor(128)
+        self.correction = BiasCorrection(128)
 
-    def forward(self, u, i, txt_inp):
-        r = self.r_branch(u, i)
-        feat = self.txt_feat(txt_inp)
-        cls_logits = self.cls_head(feat)
-        c = self.c_head(feat)
-        s = self.s_head(feat)
-        pred_y = r + c * s
-        return pred_y, cls_logits
+    def forward(self, u, i, text):
+        base_score = self.base_predictor(u, i)
+        feat = self.text_extractor(text)
+        cls_out = self.classifier(feat)
+        c = self.sarcasm_factor(feat)
+        s = self.correction(feat)
+        final_score = base_score + c * s
+        return final_score, cls_out
