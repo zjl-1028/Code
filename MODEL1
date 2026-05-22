@@ -82,4 +82,4 @@ class TotalModel(nn.Module):
         c = self.c_layer(feat)
         s = self.s_layer(feat)
         final_score = r + c * s
-        return final_score, cls_out, feat
+        return final_score, cls_out
