@@ -91,7 +91,7 @@ if __name__ == "__main__":
         total_loss = 0
         for uid, iid, txt, score in dataloader:
             optimizer.zero_grad()
-            pred_score, cls_out, feat = model(uid, iid, txt)
+            pred_score, cls_out = model(uid, iid, txt)
             label = get_consistency_label(score, feat, model.classifier)
 
             loss = mse(pred_score, score) + ce(cls_out, label)
