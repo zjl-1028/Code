@@ -2,20 +2,21 @@ import torch
 import torch.nn as nn
 
 class WordEmbScore(nn.Module):
-    def __init__(self, user_num, item_num, emb=64):
+    def __init__(self, user_num, item_num, emb_dim=64):
         super().__init__()
-        self.u_emb = nn.Embedding(user_num, emb)
-        self.i_emb = nn.Embedding(item_num, emb)
-        self.fc = nn.Sequential(
-            nn.Linear(emb*2, 64),
+        self.user_emb = nn.Embedding(user_num, emb_dim)
+        self.item_emb = nn.Embedding(item_num, emb_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(emb_dim * 2, 64),
             nn.ReLU(),
             nn.Linear(64, 1)
         )
 
-    def forward(self, u, i):
-        ue = self.u_emb(u)
-        ie = self.i_emb(i)
-        return self.fc(torch.cat([ue, ie], -1)).squeeze(-1)
+    def forward(self, user_id, item_id):
+        u = self.user_emb(user_id)
+        i = self.item_emb(item_id)
+        concat = torch.cat([u, i], dim=-1)
+        return self.mlp(concat).squeeze(-1)
 
 class TextFeatureExtractor(nn.Module):
     def __init__(self, vocab_size, embed_dim=128, hidden_dim=64):
@@ -25,56 +26,60 @@ class TextFeatureExtractor(nn.Module):
         self.bilstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True, bidirectional=True)
         self.attention = nn.MultiheadAttention(hidden_dim * 2, num_heads=2, batch_first=True)
 
-    def forward(self, x):
-        x = self.embedding(x)
+    def forward(self, text):
+        x = self.embedding(text)
         x = x.transpose(1, 2)
         x = self.cnn(x)
         x = x.transpose(1, 2)
-        x, _ = self.bilstm(x)
-        attn_out, _ = self.attention(x, x, x)
+        lstm_out, _ = self.bilstm(x)
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
         return attn_out.mean(dim=1)
 
 class CommentClassifier(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim=128):
         super().__init__()
-        self.fc = nn.Linear(input_dim, 3)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)
+        )
 
-    def forward(self, x):
-        return self.fc(x)
+    def forward(self, feat):
+        return self.mlp(feat)
 
 class SarcasmFactor(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim=128):
         super().__init__()
-        self.net = nn.Sequential(
+        self.layer = nn.Sequential(
             nn.Linear(input_dim, 1),
             nn.Sigmoid()
         )
 
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
+    def forward(self, feat):
+        return self.layer(feat).squeeze(-1)
 
 class BiasCorrection(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim=128):
         super().__init__()
-        self.fc = nn.Linear(input_dim, 1)
+        self.layer = nn.Linear(input_dim, 1)
 
-    def forward(self, x):
-        return self.fc(x).squeeze(-1)
+    def forward(self, feat):
+        return self.layer(feat).squeeze(-1)
 
 class TotalModel(nn.Module):
     def __init__(self, user_num, item_num, vocab_size):
         super().__init__()
-        self.base_predictor = WordEmbScore(user_num, item_num)
-        self.text_extractor = TextFeatureExtractor(vocab_size)
-        self.classifier = CommentClassifier(128)
-        self.sarcasm_factor = SarcasmFactor(128)
-        self.correction = BiasCorrection(128)
+        self.base_predict = WordEmbScore(user_num, item_num)
+        self.text_feat = TextFeatureExtractor(vocab_size)
+        self.classifier = CommentClassifier()
+        self.c_layer = SarcasmFactor()
+        self.s_layer = BiasCorrection()
 
-    def forward(self, u, i, text):
-        base_score = self.base_predictor(u, i)
-        feat = self.text_extractor(text)
+    def forward(self, user_id, item_id, text):
+        r = self.base_predict(user_id, item_id)
+        feat = self.text_feat(text)
         cls_out = self.classifier(feat)
-        c = self.sarcasm_factor(feat)
-        s = self.correction(feat)
-        final_score = base_score + c * s
-        return final_score, cls_out
+        c = self.c_layer(feat)
+        s = self.s_layer(feat)
+        final_score = r + c * s
+        return final_score, cls_out, feat
