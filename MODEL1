@@ -1,85 +1,79 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class WordEmbScore(nn.Module):
-    def __init__(self, user_num, item_num, emb_dim=64):
-        super().__init__()
-        self.user_emb = nn.Embedding(user_num, emb_dim)
-        self.item_emb = nn.Embedding(item_num, emb_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(emb_dim * 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, user_id, item_id):
-        u = self.user_emb(user_id)
-        i = self.item_emb(item_id)
-        concat = torch.cat([u, i], dim=-1)
-        return self.mlp(concat).squeeze(-1)
-
-class TextFeatureExtractor(nn.Module):
-    def __init__(self, vocab_size, embed_dim=128, hidden_dim=64):
+class WordAttnEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim=100, hidden_dim=64):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.cnn = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=1)
-        self.bilstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.attention = nn.MultiheadAttention(hidden_dim * 2, num_heads=2, batch_first=True)
+        self.conv = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=1)
+        self.attn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
 
-    def forward(self, text):
-        x = self.embedding(text)
-        x = x.transpose(1, 2)
-        x = self.cnn(x)
-        x = x.transpose(1, 2)
-        lstm_out, _ = self.bilstm(x)
-        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
-        return attn_out.mean(dim=1)
+    def forward(self, x):
+        x = self.embedding(x).transpose(1, 2)
+        x = self.conv(x).transpose(1, 2)
+        attn_weight = F.softmax(self.attn(x), dim=1)
+        feat = (x * attn_weight).sum(dim=1)
+        return feat
 
-class CommentClassifier(nn.Module):
-    def __init__(self, input_dim=128):
+class RAA(nn.Module):
+    def __init__(self, hidden_dim=64, H=3, lam=0.5):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 64),
+        self.H = H
+        self.lam = lam
+
+    def forward(self, u, i):
+        hu, hi = u, i
+        for _ in range(self.H):
+            dist = torch.abs(hu - hi)
+            delta_u = F.softmax(-dist, dim=-1)
+            tu = hu + self.lam * delta_u
+            hu = tu
+
+            delta_i = F.softmax(-dist, dim=-1)
+            ti = hi + self.lam * delta_i
+            hi = ti
+        return hu, hi
+
+class SarcasmCorrection(nn.Module):
+    def __init__(self, vocab_size, embed_dim=100, hidden_dim=64):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.conv = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=1)
+        self.offset_head = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Tanh()
+        )
+
+    def forward(self, text_ids):
+        x = self.embedding(text_ids).transpose(1, 2)
+        x = self.conv(x).transpose(1, 2)
+        feat = x.mean(dim=1)
+        offset = self.offset_head(feat).squeeze(-1)
+        return offset
+
+class OurFinalModel(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.user_enc = WordAttnEncoder(vocab_size)
+        self.item_enc = WordAttnEncoder(vocab_size)
+        self.raa = RAA()
+        self.sarcasm_correction = SarcasmCorrection(vocab_size)
+        self.fc = nn.Sequential(
+            nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(64, 3)
+            nn.Linear(128, 1)
         )
 
-    def forward(self, feat):
-        return self.mlp(feat)
-
-class SarcasmFactor(nn.Module):
-    def __init__(self, input_dim=128):
-        super().__init__()
-        self.layer = nn.Sequential(
-            nn.Linear(input_dim, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, feat):
-        return self.layer(feat).squeeze(-1)
-
-class BiasCorrection(nn.Module):
-    def __init__(self, input_dim=128):
-        super().__init__()
-        self.layer = nn.Linear(input_dim, 1)
-
-    def forward(self, feat):
-        return self.layer(feat).squeeze(-1)
-
-class TotalModel(nn.Module):
-    def __init__(self, user_num, item_num, vocab_size):
-        super().__init__()
-        self.base_predict = WordEmbScore(user_num, item_num)
-        self.text_feat = TextFeatureExtractor(vocab_size)
-        self.classifier = CommentClassifier()
-        self.c_layer = SarcasmFactor()
-        self.s_layer = BiasCorrection()
-
-    def forward(self, user_id, item_id, text):
-        r = self.base_predict(user_id, item_id)
-        feat = self.text_feat(text)
-        cls_out = self.classifier(feat)
-        c = self.c_layer(feat)
-        s = self.s_layer(feat)
-        final_score = r + c * s
-        return final_score, cls_out
+    def forward(self, user_ids, item_ids, text_ids):
+        u = self.user_enc(user_ids)
+        i = self.item_enc(item_ids)
+        u, i = self.raa(u, i)
+        base_pred = self.fc(torch.cat([u, i], dim=-1)).squeeze(-1)
+        offset = self.sarcasm_correction(text_ids)
+        pred = base_pred + offset
+        return pred
