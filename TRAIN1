@@ -1,104 +1,113 @@
+import sys
 import json
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from collections import defaultdict
-from model import TotalModel
+from torch.utils.data import Dataset, DataLoader, random_split
+from model_ours_final import OurFinalModel
+import functools
+print = functools.partial(print, flush=True)
 
-def clean_text(text):
-    return str(text).lower()
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def build_vocab(path, sample_num=20000):
-    word_count = defaultdict(int)
-    with open(path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-            if i >= sample_num:
-                break
+MAX_LEN = 30
+BATCH_SIZE = 128
+EPOCHS = 30
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+MIN_FREQ = 5
+
+def build_vocab(file_path):
+    word_count = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
             d = json.loads(line)
-            words = clean_text(d["reviewText"]).split()
+            words = str(d["reviewText"]).lower().split()
             for w in words:
-                word_count[w] += 1
+                word_count[w] = word_count.get(w, 0) + 1
+
     vocab = {"<PAD>": 0, "<UNK>": 1}
-    for w in word_count:
-        vocab[w] = len(vocab)
+    for w, c in word_count.items():
+        if c >= MIN_FREQ:
+            vocab[w] = len(vocab)
     return vocab
 
-class SarcasmDataset(Dataset):
-    def __init__(self, path, vocab, max_len=48, sample_num=20000):
+class ReviewDataset(Dataset):
+    def __init__(self, file_path, vocab):
         self.vocab = vocab
-        self.max_len = max_len
         self.data = []
-        self.user2id = {}
-        self.item2id = {}
-
-        with open(path, 'r', encoding='utf-8') as f:
-            for i, line in enumerate(f):
-                if i >= sample_num:
-                    break
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
                 d = json.loads(line)
-                uid = d["reviewerID"]
-                iid = d["asin"]
-                text = d["reviewText"]
+                ur = str(d["reviewText"])
+                ir = str(d["reviewText"])
+                tr = str(d["reviewText"])
                 score = float(d["overall"])
-                if uid not in self.user2id:
-                    self.user2id[uid] = len(self.user2id)
-                if iid not in self.item2id:
-                    self.item2id[iid] = len(self.item2id)
-                self.data.append((uid, iid, text, score))
+                self.data.append((ur, ir, tr, score))
 
     def encode(self, text):
-        words = clean_text(text).split()
-        ids = [self.vocab.get(w, 1) for w in words[:self.max_len]]
-        ids += [0] * (self.max_len - len(ids))
+        words = text.lower().split()[:MAX_LEN]
+        ids = [self.vocab.get(w, 1) for w in words]
+        ids += [0] * (MAX_LEN - len(ids))
         return torch.tensor(ids, dtype=torch.long)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        uid, iid, text, score = self.data[idx]
-        return self.user2id[uid], self.item2id[iid], self.encode(text), torch.tensor(score, dtype=torch.float32)
-
-def get_consistency_label(score, feat, classifier):
-    with torch.no_grad():
-        logits = classifier(feat)
-        sentiment = torch.argmax(logits, dim=-1)
-
-    label = torch.zeros_like(score, dtype=torch.long)
-    normal = (score >= 4) & (sentiment == 1) | (score <= 2) & (sentiment == 0)
-    sarcasm = (score <= 2) & (sentiment == 1)
-    strict = (score >= 4) & (sentiment == 0)
-
-    label[normal] = 0
-    label[sarcasm] = 1
-    label[strict] = 2
-    return label
+        ur, ir, tr, score = self.data[idx]
+        return self.encode(ur), self.encode(ir), self.encode(tr), torch.tensor(score)
 
 if __name__ == "__main__":
-    path = "Electronics_5.json"
-    vocab = build_vocab(path)
-    dataset = SarcasmDataset(path, vocab)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    if len(sys.argv) != 2:
+        print("Usage: python train_ours_final.py Electronics_5.json")
+        exit()
 
-    model = TotalModel(len(dataset.user2id), len(dataset.item2id), len(vocab))
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    mse = nn.MSELoss()
-    ce = nn.CrossEntropyLoss()
+    data_path = sys.argv[1]
+    vocab = build_vocab(data_path)
+    dataset = ReviewDataset(data_path, vocab)
 
-    for epoch in range(10):
+    train_len = int(0.8 * len(dataset))
+    val_len = len(dataset) - train_len
+    train_set, val_set = random_split(dataset, [train_len, val_len])
+
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+    model = OurFinalModel(len(vocab)).to(DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    best_rmse = 999.0
+
+    for epoch in range(1, EPOCHS+1):
         model.train()
-        total_loss = 0
-        for uid, iid, txt, score in dataloader:
+        train_loss = 0.0
+        for ur, ir, tr, score in train_loader:
+            ur, ir, tr, score = ur.to(DEVICE), ir.to(DEVICE), tr.to(DEVICE), score.to(DEVICE)
             optimizer.zero_grad()
-            pred_score, cls_out = model(uid, iid, txt)
-            label = get_consistency_label(score, feat, model.classifier)
-
-            loss = mse(pred_score, score) + ce(cls_out, label)
+            pred = model(ur, ir, tr)
+            loss = criterion(pred, score)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
 
-        print(f"Epoch {epoch+1} | Loss: {total_loss/len(dataloader):.4f}")
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for ur, ir, tr, score in val_loader:
+                ur, ir, tr, score = ur.to(DEVICE), ir.to(DEVICE), tr.to(DEVICE), score.to(DEVICE)
+                pred = model(ur, ir, tr)
+                val_loss += criterion(pred, score).item()
+        val_loss /= len(val_loader)
+        rmse = np.sqrt(val_loss)
 
-    torch.save(model.state_dict(), "model.pth")
+        print(f"Epoch {epoch:02d} | TrainLoss {train_loss:.4f} | ValRMSE {rmse:.4f}")
+
+        if rmse < best_rmse:
+            best_rmse = rmse
+            torch.save(model.state_dict(), "our_model_best.pt")
+            print(f"→ New best: {best_rmse:.4f}")
+
+    print(f"Training done! Best RMSE: {best_rmse:.4f}")
