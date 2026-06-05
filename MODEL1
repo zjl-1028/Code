@@ -2,78 +2,111 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class WordAttnEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=100, hidden_dim=64):
+EMBED_DIM = 100
+HIDDEN_DIM = 64
+
+class WordAttnEnc(nn.Module):
+    def __init__(self, vs, ed=100, hd=64):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.conv = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=1)
-        self.attn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
+        self.emb = nn.Embedding(vs, ed)
+        self.cnn = nn.Conv1d(ed, hd, 3, padding=1)
+        self.attn = nn.Sequential(nn.Linear(hd,hd),nn.Tanh(),nn.Linear(hd,1))
+    def forward(self,x):
+        x = self.emb(x).transpose(1,2)
+        x = self.cnn(x).transpose(1,2)
+        w = F.softmax(self.attn(x),dim=1)
+        return (x*w).sum(1)
 
-    def forward(self, x):
-        x = self.embedding(x).transpose(1, 2)
-        x = self.conv(x).transpose(1, 2)
-        attn_weight = F.softmax(self.attn(x), dim=1)
-        feat = (x * attn_weight).sum(dim=1)
-        return feat
-
-class RAA(nn.Module):
-    def __init__(self, hidden_dim=64, H=3, lam=0.5):
+class RAA_Block(nn.Module):
+    def __init__(self, H=3, lam=0.5):
         super().__init__()
         self.H = H
         self.lam = lam
-
-    def forward(self, u, i):
-        hu, hi = u, i
+    def forward(self, hu, hi):
         for _ in range(self.H):
-            dist = torch.abs(hu - hi)
-            delta_u = F.softmax(-dist, dim=-1)
-            tu = hu + self.lam * delta_u
-            hu = tu
+            dist = torch.abs(hu-hi)
+            du = F.softmax(-dist,-1)
+            tu = hu*du
+            hu = self.lam*hu + (1-self.lam)*tu
+            di = F.softmax(-dist,-1)
+            ti = hi*di
+            hi = self.lam*hi + (1-self.lam)*ti
+        return hu,hi
 
-            delta_i = F.softmax(-dist, dim=-1)
-            ti = hi + self.lam * delta_i
-            hi = ti
-        return hu, hi
-
-class SarcasmCorrection(nn.Module):
-    def __init__(self, vocab_size, embed_dim=100, hidden_dim=64):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.conv = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=1)
-        self.offset_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-            nn.Tanh()
-        )
-
-    def forward(self, text_ids):
-        x = self.embedding(text_ids).transpose(1, 2)
-        x = self.conv(x).transpose(1, 2)
-        feat = x.mean(dim=1)
-        offset = self.offset_head(feat).squeeze(-1)
-        return offset
-
-class OurFinalModel(nn.Module):
+# 用户物品R分支
+class Branch_R(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
-        self.user_enc = WordAttnEncoder(vocab_size)
-        self.item_enc = WordAttnEncoder(vocab_size)
-        self.raa = RAA()
-        self.sarcasm_correction = SarcasmCorrection(vocab_size)
-        self.fc = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
+        self.u_enc = WordAttnEnc(vocab_size)
+        self.i_enc = WordAttnEnc(vocab_size)
+        self.raa = RAA_Block()
+        self.fusion = nn.Sequential(nn.Linear(128,64),nn.ELU())
+        self.reg_head = nn.Linear(64,1)
+    def forward(self, ur, ir):
+        u_feat = self.u_enc(ur)
+        i_feat = self.i_enc(ir)
+        u_feat,i_feat = self.raa(u_feat,i_feat)
+        fuse = torch.cat([u_feat,i_feat],-1)
+        r = self.reg_head(self.fusion(fuse)).squeeze(-1)
+        return r
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad = False
 
-    def forward(self, user_ids, item_ids, text_ids):
-        u = self.user_enc(user_ids)
-        i = self.item_enc(item_ids)
-        u, i = self.raa(u, i)
-        base_pred = self.fc(torch.cat([u, i], dim=-1)).squeeze(-1)
-        offset = self.sarcasm_correction(text_ids)
-        pred = base_pred + offset
+# 评论CS分支
+class Branch_CS(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.rev_emb = nn.Embedding(vocab_size,100)
+        self.cnn = nn.Conv1d(100,64,3,padding=1)
+        self.lstm = nn.LSTM(64,64,batch_first=True,bidirectional=True)
+        self.cls_mlp = nn.Sequential(nn.Linear(128,64),nn.ReLU(),nn.Linear(64,3))
+        self.c_out = nn.Sequential(nn.Linear(128,1),nn.Sigmoid())
+        self.s_out = nn.Linear(128,1)
+    def forward(self, txt):
+        x = self.rev_emb(txt).transpose(1,2)
+        x = self.cnn(x).transpose(1,2)
+        x,_ = self.lstm(x)
+        feat = x.mean(1)
+        logits = self.cls_mlp(feat)
+        c = self.c_out(feat).squeeze(-1)
+        s = self.s_out(feat).squeeze(-1)
+        cs = c * s
+        return cs, logits
+
+# PBFL基线
+class PBFL(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.u_enc = WordAttnEnc(vocab_size)
+        self.i_enc = WordAttnEnc(vocab_size)
+        self.raa = RAA_Block()
+        self.rev_emb = nn.Embedding(vocab_size,100)
+        self.cnn = nn.Conv1d(100,64,3,padding=1)
+        self.lstm = nn.LSTM(64,64,batch_first=True,bidirectional=True)
+        self.fuse_all = nn.Sequential(nn.Linear(128+128,64),nn.ELU())
+        self.out = nn.Linear(64,1)
+    def forward(self, ur, ir, txt):
+        uf = self.u_enc(ur)
+        if_feat = self.i_enc(ir)
+        uf,if_feat = self.raa(uf,if_feat)
+        ui = torch.cat([uf,if_feat],-1)
+        tx = self.rev_emb(txt).transpose(1,2)
+        tx = self.cnn(tx).transpose(1,2)
+        tx,_ = self.lstm(tx)
+        rf = tx.mean(1)
+        all_f = torch.cat([ui,rf],-1)
+        pred = self.out(self.fuse_all(all_f)).squeeze(-1)
         return pred
+
+# 融合 y=r+cs
+class OUR_Infer:
+    def __init__(self, r_net, cs_net):
+        self.r_net = r_net.eval()
+        self.cs_net = cs_net.eval()
+    def pred(self, ur,ir,txt):
+        with torch.no_grad():
+            r = self.r_net(ur,ir)
+            cs,_ = self.cs_net(txt)
+            y = r + cs
+        return y
