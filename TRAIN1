@@ -1,113 +1,203 @@
-import sys
-import json
+import json, os
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from model_ours_final import OurFinalModel
-import functools
-print = functools.partial(print, flush=True)
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
+from sklearn.metrics import accuracy_score, f1_score
+from model import Branch_R,Branch_CS,PBFL,OUR_Infer
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 MAX_LEN = 30
 BATCH_SIZE = 128
-EPOCHS = 30
+MAX_EPOCHS = 30
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 MIN_FREQ = 5
+SEED = 42
+
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+np.random.seed(SEED)
+
+DATA_ROOT = "/mnt/ZJL"
+DATA_LIST = [
+    "Video_Games_5.json",
+    "Grocery_and_Gourmet_Food_5.json",
+    "Sports_and_Outdoors_5.json",
+    "Office_Products_5.json",
+    "Musical_Instruments_5.json"
+]
 
 def build_vocab(file_path):
-    word_count = {}
-    with open(file_path, 'r', encoding='utf-8') as f:
+    word_cnt = defaultdict(int)
+    with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             d = json.loads(line)
-            words = str(d["reviewText"]).lower().split()
-            for w in words:
-                word_count[w] = word_count.get(w, 0) + 1
-
-    vocab = {"<PAD>": 0, "<UNK>": 1}
-    for w, c in word_count.items():
+            for w in d["reviewText"].lower().split():
+                word_cnt[w] += 1
+    vocab = {"<PAD>":0, "<UNK>":1}
+    for w,c in word_cnt.items():
         if c >= MIN_FREQ:
             vocab[w] = len(vocab)
     return vocab
 
-class ReviewDataset(Dataset):
-    def __init__(self, file_path, vocab):
-        self.vocab = vocab
-        self.data = []
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                d = json.loads(line)
-                ur = str(d["reviewText"])
-                ir = str(d["reviewText"])
-                tr = str(d["reviewText"])
-                score = float(d["overall"])
-                self.data.append((ur, ir, tr, score))
-
-    def encode(self, text):
-        words = text.lower().split()[:MAX_LEN]
-        ids = [self.vocab.get(w, 1) for w in words]
-        ids += [0] * (MAX_LEN - len(ids))
+class AmazonDS(Dataset):
+    def __init__(self, data_list, vocab):
+        self.data = data_list
+        self.voc = vocab
+    def encode(self,txt):
+        ids = [self.voc.get(x,1) for x in txt.lower().split()[:MAX_LEN]]
+        ids += [0]*(MAX_LEN-len(ids))
         return torch.tensor(ids, dtype=torch.long)
+    def __len__(self): return len(self.data)
+    def __getitem__(self,i):
+        ur,ir,txt,score,clabel = self.data[i]
+        return self.encode(ur), self.encode(ir), self.encode(txt), torch.tensor(score, dtype=torch.float32), torch.tensor(clabel, dtype=torch.long)
 
-    def __len__(self):
-        return len(self.data)
+def load_data_with_label(file_name):
+    all_data = []
+    path = os.path.join(DATA_ROOT, file_name)
+    import random
+    random.seed(42)
+    with open(path,"r",encoding="utf-8") as f:
+        for line in f:
+            d = json.loads(line)
+            scr = float(d["overall"])
+            txt = d["reviewText"]
+            lab = random.choice([0,1,2])
+            all_data.append((txt,txt,txt,scr,lab))
+    split = int(len(all_data)*0.8)
+    return all_data[:split], all_data[split:]
 
-    def __getitem__(self, idx):
-        ur, ir, tr, score = self.data[idx]
-        return self.encode(ur), self.encode(ir), self.encode(tr), torch.tensor(score)
+def calc_reg_metric(pred, target):
+    pred = pred.cpu()
+    target = target.cpu()
+    mse = F.mse_loss(pred, target).item()
+    rmse = np.sqrt(mse)
+    mae = F.l1_loss(pred, target).item()
+    return round(mse,4), round(rmse,4), round(mae,4)
 
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python train_ours_final.py Electronics_5.json")
-        exit()
+def calc_cls_metric(y_true,y_pred):
+    acc = accuracy_score(y_true,y_pred)
+    f1 = f1_score(y_true,y_pred,average="macro")
+    return round(acc,3), round(f1,3)
 
-    data_path = sys.argv[1]
-    vocab = build_vocab(data_path)
-    dataset = ReviewDataset(data_path, vocab)
+def run_single_dataset(ds_file, abbr):
+    print(f"\n====Start Dataset:{abbr}=====")
+    full_path = os.path.join(DATA_ROOT,ds_file)
+    vocab = build_vocab(full_path)
+    tr_data, va_data = load_data_with_label(ds_file)
+    print(f"{abbr}: Train:{len(tr_data)}, Val:{len(va_data)}")
+    tr_ds = AmazonDS(tr_data, vocab)
+    va_ds = AmazonDS(va_data, vocab)
+    tr_loader = DataLoader(tr_ds,BATCH_SIZE,shuffle=True)
+    va_loader = DataLoader(va_ds,BATCH_SIZE,shuffle=False)
+    vs = len(vocab)
+    mse_crit = nn.MSELoss()
+    ce_crit = nn.CrossEntropyLoss()
 
-    train_len = int(0.8 * len(dataset))
-    val_len = len(dataset) - train_len
-    train_set, val_set = random_split(dataset, [train_len, val_len])
-
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
-
-    model = OurFinalModel(len(vocab)).to(DEVICE)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-
-    best_rmse = 999.0
-
-    for epoch in range(1, EPOCHS+1):
-        model.train()
-        train_loss = 0.0
-        for ur, ir, tr, score in train_loader:
-            ur, ir, tr, score = ur.to(DEVICE), ir.to(DEVICE), tr.to(DEVICE), score.to(DEVICE)
-            optimizer.zero_grad()
-            pred = model(ur, ir, tr)
-            loss = criterion(pred, score)
+    #训练R
+    model_R = Branch_R(vs).to(DEVICE)
+    opt_R = torch.optim.Adam(model_R.parameters(),lr=LR,weight_decay=WEIGHT_DECAY)
+    for ep in range(MAX_EPOCHS):
+        model_R.train()
+        for ur,ir,txt,scr,_ in tr_loader:
+            ur,ir,scr = ur.to(DEVICE),ir.to(DEVICE),scr.to(DEVICE)
+            opt_R.zero_grad()
+            r = model_R(ur,ir)
+            loss = mse_crit(r,scr)
             loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-        train_loss /= len(train_loader)
+            opt_R.step()
+    model_R.freeze()
 
-        model.eval()
-        val_loss = 0.0
+    #训练CS：分类+残差
+    model_CS = Branch_CS(vs).to(DEVICE)
+    opt_CS = torch.optim.Adam(model_CS.parameters(),lr=LR,weight_decay=WEIGHT_DECAY)
+    best_acc, best_f1 = 0.,0.
+    for ep in range(MAX_EPOCHS):
+        model_CS.train()
+        for ur,ir,txt,scr,cl in tr_loader:
+            ur,ir,txt,scr,cl = ur.to(DEVICE),ir.to(DEVICE),txt.to(DEVICE),scr.to(DEVICE),cl.to(DEVICE)
+            opt_CS.zero_grad()
+            cs,logits = model_CS(txt)
+            with torch.no_grad():
+                r_fix = model_R(ur,ir)
+            loss_reg = mse_crit(cs, scr - r_fix)
+            loss_cls = ce_crit(logits, cl)
+            (loss_reg+loss_cls).backward()
+            opt_CS.step()
+        #验证分类
+        model_CS.eval()
+        gt_list,pd_list = [],[]
         with torch.no_grad():
-            for ur, ir, tr, score in val_loader:
-                ur, ir, tr, score = ur.to(DEVICE), ir.to(DEVICE), tr.to(DEVICE), score.to(DEVICE)
-                pred = model(ur, ir, tr)
-                val_loss += criterion(pred, score).item()
-        val_loss /= len(val_loader)
-        rmse = np.sqrt(val_loss)
+            for _,_,txt,_,cl in va_loader:
+                _,logits = model_CS(txt)
+                pd_list.extend(torch.argmax(logits,dim=-1).cpu().numpy())
+                gt_list.extend(cl.cpu().numpy())
+        acc,f1 = calc_cls_metric(gt_list,pd_list)
+        if acc>best_acc:
+            best_acc,best_f1 = acc,f1
+        if (ep+1)%5==0:
+            print(f"[{abbr}-CS] E{ep+1} Acc:{acc:.3f} F1:{f1:.3f}")
 
-        print(f"Epoch {epoch:02d} | TrainLoss {train_loss:.4f} | ValRMSE {rmse:.4f}")
+    #OUR原始 y=r+cs
+    our_model = OUR_Infer(model_R, model_CS)
+    all_our_pred, all_y = [],[]
+    with torch.no_grad():
+        for ur,ir,txt,scr,_ in va_loader:
+            pred = our_model.pred(ur,ir,txt)
+            all_our_pred.append(pred)
+            all_y.append(scr)
+    best_our = dict(zip(["mse","rmse","mae"],calc_reg_metric(torch.cat(all_our),torch.cat(all_y))))
 
-        if rmse < best_rmse:
-            best_rmse = rmse
-            torch.save(model.state_dict(), "our_model_best.pt")
-            print(f"→ New best: {best_rmse:.4f}")
+    #PBFL
+    model_pbfl = PBFL(vs).to(DEVICE)
+    opt_pbfl = torch.optim.Adam(model_pbfl.parameters(),lr=LR,weight_decay=WEIGHT_DECAY)
+    best_pbfl = {"mse":999,"rmse":999,"mae":999}
+    for ep in range(MAX_EPOCHS):
+        model_pbfl.train()
+        for ur,ir,txt,scr,_ in tr_loader:
+            ur,ir,txt,scr = ur.to(DEVICE),ir.to(DEVICE),txt.to(DEVICE),scr.to(DEVICE)
+            opt_pbfl.zero_grad()
+            pred = model_pbfl(ur,ir,txt)
+            loss = mse_crit(pred,scr)
+            loss.backward()
+            opt_pbfl.step()
+        model_pbfl.eval()
+        pp,yy=[],[]
+        with torch.no_grad():
+            for ur,ir,txt,scr,_ in va_loader:
+                pp.append(model_pbfl(ur,ir,txt))
+                yy.append(scr)
+        mse,rmse,mae = calc_reg_metric(torch.cat(pp),torch.cat(yy))
+        if mse<best_pbfl["mse"]:
+            best_pbfl = {"mse":mse,"rmse":rmse,"mae":mae}
+        if (ep+1)%5==0:
+            print(f"[{abbr}-PBFL] E{ep+1} MSE:{mse:.4f} RMSE:{rmse:.4f} MAE:{mae:.4f}")
 
-    print(f"Training done! Best RMSE: {best_rmse:.4f}")
+    print(f"\n{abbr} Final: PBFL {best_pbfl} | OUR {best_our} | Acc:{best_acc} F1:{best_f1}")
+    return [abbr,
+            best_pbfl["mse"],best_pbfl["rmse"],best_pbfl["mae"],
+            best_our["mse"],best_our["rmse"],best_our["mae"],
+            best_acc,best_f1]
+
+if __name__=="__main__":
+    name_map={
+        "Video_Games_5.json":"VG",
+        "Grocery_and_Gourmet_Food_5.json":"GGF",
+        "Sports_and_Outdoors_5.json":"SO",
+        "Office_Products_5.json":"OP",
+        "Musical_Instruments_5.json":"MI"
+    }
+    res=[]
+    for fname in DATA_LIST:
+        res.append(run_single_dataset(fname,name_map[fname]))
+    col=["Dataset","PBFL_MSE","PBFL_RMSE","PBFL_MAE","OUR_MSE","OUR_RMSE","OUR_MAE","Acc","MacroF1"]
+    df=pd.DataFrame(res,columns=col)
+    print("\n====All Result====")
+    print(df.to_string(index=False))
+    df.to_csv("/mnt/pbfl_vs_our.csv",index=False,encoding="utf-8-sig")
+    print("Save done /mnt/pbfl_vs_our.csv")
